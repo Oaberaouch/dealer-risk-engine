@@ -182,6 +182,8 @@ def synthetic_zero_gamma(
     dealer_sign: int = Query(-1),
     use_call_put_netting: bool = Query(True),
     mode: str = Query("netted"),  # "netted" or "raw"
+    tol_rel: float = Query(1e-6, gt=0.0, le=1e-2),  # NEW (default preserves behavior)
+    max_iter: int = Query(140, ge=20, le=500),      # optional, keeps solver robust
     seed: int = Query(42, ge=0, le=10_000),
 ):
     cfg_syn = _make_synth_cfg(
@@ -204,7 +206,14 @@ def synthetic_zero_gamma(
     hi = spot * (1.0 + bracket_pct)
 
     mode = "raw" if mode.lower() == "raw" else "netted"
-    res = zero_gamma_level(chain, cfg, bracket=(lo, hi), mode=mode)
+    res = zero_gamma_level(
+        chain,
+        cfg,
+        bracket=(lo, hi),
+        mode=mode,
+        tol_rel=float(tol_rel),
+        max_iter=int(max_iter),
+    )
 
     return {
         "symbol": "SPY",
@@ -214,6 +223,8 @@ def synthetic_zero_gamma(
         "dealer_sign": dealer_sign,
         "use_call_put_netting": use_call_put_netting,
         "mode": mode,
+        "tol_rel": float(tol_rel),
+        "max_iter": int(max_iter),
         "synthetic_params": {
             "base_iv": base_iv,
             "strikes_pct_range": strikes_pct_range,
@@ -245,6 +256,8 @@ def synthetic_zero_gamma_compare(
     min_share: float = Query(0.10, ge=0.0, le=0.49),
     bracket_pct: float = Query(0.25, gt=0.02, le=0.80),
     dealer_sign: int = Query(-1),
+    tol_rel: float = Query(1e-6, gt=0.0, le=1e-2),  # NEW
+    max_iter: int = Query(140, ge=20, le=500),      # optional
     seed: int = Query(42, ge=0, le=10_000),
 ):
     cfg_syn = _make_synth_cfg(
@@ -268,10 +281,24 @@ def synthetic_zero_gamma_compare(
     lo = spot * (1.0 - bracket_pct)
     hi = spot * (1.0 + bracket_pct)
 
-    netted = zero_gamma_level(chain, cfg, bracket=(lo, hi), mode="netted")
-    raw = zero_gamma_level(chain, cfg, bracket=(lo, hi), mode="raw")
+    netted = zero_gamma_level(
+        chain,
+        cfg,
+        bracket=(lo, hi),
+        mode="netted",
+        tol_rel=float(tol_rel),
+        max_iter=int(max_iter),
+    )
+    raw = zero_gamma_level(
+        chain,
+        cfg,
+        bracket=(lo, hi),
+        mode="raw",
+        tol_rel=float(tol_rel),
+        max_iter=int(max_iter),
+    )
 
-    both_found = bool(netted["found"] and raw["found"])
+    both_found = bool(netted.get("found") and raw.get("found"))
     level_diff = (float(netted["level"]) - float(raw["level"])) if both_found else None
 
     return {
@@ -280,6 +307,8 @@ def synthetic_zero_gamma_compare(
         "expiry_days": expiry_days,
         "bracket": [lo, hi],
         "dealer_sign": dealer_sign,
+        "tol_rel": float(tol_rel),
+        "max_iter": int(max_iter),
         "synthetic_params": {
             "base_iv": base_iv,
             "strikes_pct_range": strikes_pct_range,
@@ -424,8 +453,6 @@ def synthetic_gamma_profile_compare(
     }
 
 
-# ////////////////////////////////////////////////////////////////////
-
 @app.get("/synthetic/summary")
 def synthetic_summary(
     spot: float = Query(500.0, gt=0),
@@ -452,6 +479,7 @@ def synthetic_summary(
     - sign at spot (netted vs raw)
     - max/min over a span for both
     - most influential strike by |net OI| (calls - puts)
+    - optional scaling of GEX numbers for readability
     """
     cfg_syn = _make_synth_cfg(
         spot=spot,
@@ -468,54 +496,46 @@ def synthetic_summary(
     )
     chain = generate_option_chain(cfg_syn, seed=seed)
 
-    def _scale_factor(name: str) -> float:
-        n = (name or "raw").strip().lower()
-        if n in ("raw", "none", "1"):
-            return 1.0
-        if n in ("k", "thousand", "thousands"):
-            return 1e3
-        if n in ("m", "mm", "million", "millions"):
-            return 1e6
-        if n in ("b", "bn", "billion", "billions"):
-            return 1e9
-        return 1.0
+    # scaling
+    scale_key = (scale or "raw").lower().strip()
+    scale_divisor = 1.0
+    if scale_key in ("k", "thousand"):
+        scale_divisor = 1e3
+        scale_key = "k"
+    elif scale_key in ("m", "million"):
+        scale_divisor = 1e6
+        scale_key = "m"
+    elif scale_key in ("b", "billion"):
+        scale_divisor = 1e9
+        scale_key = "b"
+    else:
+        scale_key = "raw"
+        scale_divisor = 1.0
 
-    sf = _scale_factor(scale)
-    scale_label = (scale or "raw").strip().lower()
-    if scale_label in ("none", "1"):
-        scale_label = "raw"
-
-    def _fmt(x: float) -> float:
-        return float(x) / sf
+    def _sc(x: float) -> float:
+        return float(x) / float(scale_divisor)
 
     lo = spot * (1.0 - bracket_pct)
     hi = spot * (1.0 + bracket_pct)
 
-    # Use the same assumption you’ve been testing:
-    # we compute both "netted" (aggregate by strike, calls +, puts -)
-    # and "raw" (per-contract signed OI, still calls +, puts -; different route)
-    cfg_netted = GexConfig(dealer_sign=dealer_sign, use_call_put_netting=True)
-    cfg_raw = GexConfig(dealer_sign=dealer_sign, use_call_put_netting=True)
+    cfg_eval = GexConfig(dealer_sign=dealer_sign, use_call_put_netting=True)
 
-    zg_netted = zero_gamma_level(chain, cfg_netted, bracket=(lo, hi), mode="netted")
-    zg_raw = zero_gamma_level(chain, cfg_raw, bracket=(lo, hi), mode="raw")
+    zg_netted = zero_gamma_level(chain, cfg_eval, bracket=(lo, hi), mode="netted")
+    zg_raw = zero_gamma_level(chain, cfg_eval, bracket=(lo, hi), mode="raw")
 
-    # Scale gex endpoints for readability (keep level unchanged)
-    for d in (zg_netted, zg_raw):
-        if isinstance(d, dict):
-            if "gex_lo" in d and d["gex_lo"] is not None:
-                d["gex_lo"] = _fmt(float(d["gex_lo"]))
-            if "gex_hi" in d and d["gex_hi"] is not None:
-                d["gex_hi"] = _fmt(float(d["gex_hi"]))
-
-    # profiles via the existing compare function (safest / consistent)
+    # profiles (use your existing compare profile builder)
     s_min = spot * (1.0 - span_pct)
     s_max = spot * (1.0 + span_pct)
 
-    prof = gamma_profile_both(chain, cfg_netted, s_min=s_min, s_max=s_max, steps=steps)
-    grid = prof["S"]
-    gex_netted = prof["netted"]
-    gex_raw = prof["raw"]
+    prof = gamma_profile_both(chain, cfg_eval, s_min=s_min, s_max=s_max, steps=steps)
+
+    # at spot: use nearest grid point from profile for consistency
+    S_grid = prof["S"]
+    nearest_S = min(S_grid, key=lambda x: abs(float(x) - float(spot))) if S_grid else float(spot)
+    idx = S_grid.index(nearest_S) if S_grid else 0
+
+    g_spot_netted = float(prof["netted"][idx]) if prof["netted"] else 0.0
+    g_spot_raw = float(prof["raw"][idx]) if prof["raw"] else 0.0
 
     def _sign(x: float) -> str:
         if x > 0:
@@ -524,18 +544,18 @@ def synthetic_summary(
             return "negative"
         return "zero"
 
-    # extrema
-    import numpy as np
+    # extrema over span
+    netted_vals = [float(x) for x in prof["netted"]]
+    raw_vals = [float(x) for x in prof["raw"]]
+    net_max = max(netted_vals) if netted_vals else 0.0
+    net_min = min(netted_vals) if netted_vals else 0.0
+    raw_max = max(raw_vals) if raw_vals else 0.0
+    raw_min = min(raw_vals) if raw_vals else 0.0
 
-    net_max = max(gex_netted)
-    net_min = min(gex_netted)
-    raw_max = max(gex_raw)
-    raw_min = min(gex_raw)
-
-    net_max_S = float(grid[int(np.argmax(gex_netted))])
-    net_min_S = float(grid[int(np.argmin(gex_netted))])
-    raw_max_S = float(grid[int(np.argmax(gex_raw))])
-    raw_min_S = float(grid[int(np.argmin(gex_raw))])
+    net_max_S = float(S_grid[int(netted_vals.index(net_max))]) if netted_vals else float(spot)
+    net_min_S = float(S_grid[int(netted_vals.index(net_min))]) if netted_vals else float(spot)
+    raw_max_S = float(S_grid[int(raw_vals.index(raw_max))]) if raw_vals else float(spot)
+    raw_min_S = float(S_grid[int(raw_vals.index(raw_min))]) if raw_vals else float(spot)
 
     # most influential strike by |net OI| (calls - puts)
     net_oi_by_strike = {}
@@ -551,20 +571,28 @@ def synthetic_summary(
         k_star = None
         k_star_val = 0.0
 
-    # at spot: use nearest grid point from prof (stable + consistent)
-    nearest_idx = int(np.argmin([abs(float(S) - float(spot)) for S in grid]))
-    nearest_S = float(grid[nearest_idx])
-
-    g_spot_netted = float(gex_netted[nearest_idx])
-    g_spot_raw = float(gex_raw[nearest_idx])
+    # scale gex_lo/gex_hi in zero-gamma outputs for readability
+    def _scale_zg(zg: dict) -> dict:
+        if not isinstance(zg, dict):
+            return zg
+        out = dict(zg)
+        if "gex_lo" in out and out["gex_lo"] is not None:
+            out["gex_lo"] = _sc(float(out["gex_lo"]))
+        if "gex_hi" in out and out["gex_hi"] is not None:
+            out["gex_hi"] = _sc(float(out["gex_hi"]))
+        if "gex_level" in out and out["gex_level"] is not None:
+            out["gex_level"] = _sc(float(out["gex_level"]))
+        if "target" in out and out["target"] is not None:
+            out["target"] = _sc(float(out["target"]))
+        return out
 
     return {
         "symbol": "SPY",
         "spot": spot,
         "expiry_days": expiry_days,
         "dealer_sign": dealer_sign,
-        "scale": scale_label,
-        "scale_divisor": sf,  # values shown are divided by this
+        "scale": scale_key,
+        "scale_divisor": float(scale_divisor),
         "bracket": [lo, hi],
         "range": [s_min, s_max],
         "steps": steps,
@@ -581,18 +609,28 @@ def synthetic_summary(
             "seed": seed,
         },
         "zero_gamma": {
-            "netted": {"mode": "netted", "result": zg_netted},
-            "raw": {"mode": "raw", "result": zg_raw},
+            "netted": {"mode": "netted", "result": _scale_zg(zg_netted)},
+            "raw": {"mode": "raw", "result": _scale_zg(zg_raw)},
         },
         "at_spot": {
             "note": "at_spot uses the nearest S grid point from gamma_profile_both",
-            "nearest_S": nearest_S,
-            "netted": {"gex": _fmt(g_spot_netted), "sign": _sign(g_spot_netted)},
-            "raw": {"gex": _fmt(g_spot_raw), "sign": _sign(g_spot_raw)},
+            "nearest_S": float(nearest_S),
+            "netted": {"gex": _sc(g_spot_netted), "sign": _sign(g_spot_netted)},
+            "raw": {"gex": _sc(g_spot_raw), "sign": _sign(g_spot_raw)},
         },
         "extrema_over_span": {
-            "netted": {"max": _fmt(net_max), "max_S": net_max_S, "min": _fmt(net_min), "min_S": net_min_S},
-            "raw": {"max": _fmt(raw_max), "max_S": raw_max_S, "min": _fmt(raw_min), "min_S": raw_min_S},
+            "netted": {
+                "max": _sc(net_max),
+                "max_S": net_max_S,
+                "min": _sc(net_min),
+                "min_S": net_min_S,
+            },
+            "raw": {
+                "max": _sc(raw_max),
+                "max_S": raw_max_S,
+                "min": _sc(raw_min),
+                "min_S": raw_min_S,
+            },
         },
         "most_influential_strike_by_abs_net_oi": {
             "strike": k_star,
