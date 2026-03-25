@@ -1,18 +1,31 @@
+# packages/core/data/providers/router.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
-from packages.core.data.providers.base import MarketDataProvider, ProviderResult
+from packages.core.schemas.market import UnderlyingSnapshot
+from packages.core.data.providers.polygon import PolygonProvider, PolygonError
+
+
+ProviderName = Literal["polygon"]
 
 
 @dataclass
-class FallbackProvider(MarketDataProvider):
-    primary: MarketDataProvider
-    fallback: MarketDataProvider
+class ProviderRouter:
+    """
+    Small router for provider selection.
+    Extend later with options chain providers, OPRA, etc.
+    """
 
-    def get_chain(self, symbol: str, expiry_days: int, *, spot_hint: Optional[float] = None) -> ProviderResult:
-        try:
-            return self.primary.get_chain(symbol, expiry_days, spot_hint=spot_hint)
-        except Exception:
-            return self.fallback.get_chain(symbol, expiry_days, spot_hint=spot_hint)
+    polygon: PolygonProvider
+
+    @classmethod
+    def from_env(cls) -> "ProviderRouter":
+        return cls(polygon=PolygonProvider.from_env())
+
+    def get_spot(self, symbol: str, provider: ProviderName = "polygon") -> UnderlyingSnapshot:
+        if provider == "polygon":
+            return self.polygon.get_spot(symbol)
+        # Should never happen due to typing, but keep safe:
+        raise ValueError(f"Unknown provider: {provider}")

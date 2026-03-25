@@ -3,317 +3,134 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
-import requests
+import httpx
 
-
-class PolygonError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class PolygonConfig:
-    api_key: str
-    base_url: str = "https://api.polygon.io"
-    timeout_sec: int = 15
-
-
-def _get_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise PolygonError(
-            f"Missing environment variable: {name}. "
-            f"Set it in your .env (or export it) before running."
-        )
-    return v
-
-
-class PolygonClient:
-    """
-    Minimal Polygon.io client for SU-57 (starter, free-first):
-
-    - get_spot_last(ticker): last trade price for an equity ticker
-    - list_option_contracts(underlying): list option contracts (reference endpoint)
-
-    Notes:
-    - Polygon endpoints can vary by subscription (delayed vs real-time, options access).
-    - We keep this client small and explicit so you can extend safely.
-    """
-
-    def __init__(self, cfg: Optional[PolygonConfig] = None) -> None:
-        if cfg is None:
-            cfg = PolygonConfig(api_key=_get_env("POLYGON_API_KEY"))
-        self.cfg = cfg
-
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        url = f"{self.cfg.base_url.rstrip('/')}{path}"
-        params = dict(params or {})
-        params["apiKey"] = self.cfg.api_key
-
-        try:
-            r = requests.get(url, params=params, timeout=self.cfg.timeout_sec)
-        except requests.RequestException as e:
-            raise PolygonError(f"Network error calling Polygon: {e}") from e
-
-        # Polygon returns JSON for errors too, but not always.
-        try:
-            data = r.json()
-        except ValueError:
-            data = {"raw": r.text}
-
-        if r.status_code >= 400:
-            msg = data.get("error") or data.get("message") or str(data)
-            raise PolygonError(f"Polygon HTTP {r.status_code}: {msg}")
-
-        return data
-
-    def get_spot_last(self, ticker: str) -> float:
-        """
-        Equity last trade price.
-
-        Endpoint: /v2/last/trade/{ticker}
-        """
-        ticker = ticker.upper().strip()
-        data = self._get(f"/v2/last/trade/{ticker}")
-        # Expected: {"status":"OK","results":{"p":..., ...}}
-        results = data.get("results") or {}
-        p = results.get("p")
-        if p is None:
-            raise PolygonError(f"Unexpected response for last trade: {data}")
-        return float(p)
-
-    def list_option_contracts(
-        self,
-        underlying: str,
-        as_of: Optional[str] = None,
-        expiration_date: Optional[str] = None,
-        contract_type: Optional[str] = None,  # "call" / "put"
-        strike_price: Optional[float] = None,
-        limit: int = 1000,
-    ) -> List[Dict[str, Any]]:
-        """
-        List option contracts for an underlying.
-
-        Endpoint: /v3/reference/options/contracts
-        Common params:
-          - underlying_ticker=SPY
-          - as_of=YYYY-MM-DD
-          - expiration_date=YYYY-MM-DD
-          - contract_type=call|put
-          - strike_price=...
-          - limit=...
-        """
-        underlying = underlying.upper().strip()
-
-        params: Dict[str, Any] = {
-            "underlying_ticker": underlying,
-            "limit": int(limit),
-        }
-        if as_of:
-            params["as_of"] = as_of
-        if expiration_date:
-            params["expiration_date"] = expiration_date
-        if contract_type:
-            params["contract_type"] = contract_type.lower()
-        if strike_price is not None:
-            params["strike_price"] = float(strike_price)
-
-        out: List[Dict[str, Any]] = []
-        next_url: Optional[str] = None
-
-        # Polygon is paginated. We follow next_url if present.
-        while True:
-            if next_url:
-                # next_url is a full URL and already contains apiKey sometimes; but not guaranteed.
-                # We re-call via requests to preserve it exactly, then inject apiKey if missing.
-                url = next_url
-                if "apiKey=" not in url:
-                    sep = "&" if "?" in url else "?"
-                    url = f"{url}{sep}apiKey={self.cfg.api_key}"
-                try:
-                    r = requests.get(url, timeout=self.cfg.timeout_sec)
-                    data = r.json()
-                except Exception as e:
-                    raise PolygonError(f"Pagination error calling Polygon: {e}") from e
-
-                if r.status_code >= 400:
-                    msg = data.get("error") or data.get("message") or str(data)
-                    raise PolygonError(f"Polygon HTTP {r.status_code}: {msg}")
-            else:
-                data = self._get("/v3/reference/options/contracts", params=params)
-
-            results = data.get("results") or []
-            if not isinstance(results, list):
-                raise PolygonError(f"Unexpected contracts response: {data}")
-
-            out.extend(results)
-
-            next_url = data.get("next_url")
-            if not next_url:
-                break
-
-            # Safety: don’t loop forever if Polygon keeps returning next_url
-            if len(out) > 200_000:
-                raise PolygonError("Too many option contracts returned; aborting pagination.")
-
-        return out# packages/core/data/providers/polygon.py
-from __future__ import annotations
-
-import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-
-import requests
+from packages.core.schemas.market import UnderlyingSnapshot
 
 
 class PolygonError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class PolygonConfig:
+@dataclass
+class PolygonProvider:
+    """
+    Polygon spot provider with free-tier fallback.
+
+    Primary (best): last trade (often restricted on free tiers)
+      GET /v2/last/trade/{ticker}
+
+    Fallback (usually available on basic/free for stocks): previous close (EOD proxy)
+      GET /v2/aggs/ticker/{ticker}/prev
+    """
+
     api_key: str
     base_url: str = "https://api.polygon.io"
-    timeout_sec: int = 15
+    timeout_s: float = 10.0
 
+    @classmethod
+    def from_env(cls) -> "PolygonProvider":
+        key = os.getenv("POLYGON_API_KEY", "").strip()
+        if not key:
+            raise PolygonError("POLYGON_API_KEY is not set (check .env and load_dotenv).")
+        return cls(api_key=key)
 
-def _get_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise PolygonError(
-            f"Missing environment variable: {name}. "
-            f"Set it in your .env (or export it) before running."
-        )
-    return v
-
-
-class PolygonClient:
-    """
-    Minimal Polygon.io client for SU-57 (starter, free-first):
-
-    - get_spot_last(ticker): last trade price for an equity ticker
-    - list_option_contracts(underlying): list option contracts (reference endpoint)
-
-    Notes:
-    - Polygon endpoints can vary by subscription (delayed vs real-time, options access).
-    - We keep this client small and explicit so you can extend safely.
-    """
-
-    def __init__(self, cfg: Optional[PolygonConfig] = None) -> None:
-        if cfg is None:
-            cfg = PolygonConfig(api_key=_get_env("POLYGON_API_KEY"))
-        self.cfg = cfg
-
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        url = f"{self.cfg.base_url.rstrip('/')}{path}"
-        params = dict(params or {})
-        params["apiKey"] = self.cfg.api_key
+    def _get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        q = dict(params or {})
+        q["apiKey"] = self.api_key
 
         try:
-            r = requests.get(url, params=params, timeout=self.cfg.timeout_sec)
-        except requests.RequestException as e:
-            raise PolygonError(f"Network error calling Polygon: {e}") from e
+            with httpx.Client(timeout=self.timeout_s) as client:
+                r = client.get(url, params=q)
+        except Exception as e:
+            raise PolygonError(f"Polygon request failed: {e}") from e
 
-        # Polygon returns JSON for errors too, but not always.
+        if r.status_code != 200:
+            # Keep payload for debugging
+            raise PolygonError(f"Polygon HTTP {r.status_code}: {r.text}")
+
         try:
-            data = r.json()
-        except ValueError:
-            data = {"raw": r.text}
+            return r.json()
+        except Exception as e:
+            raise PolygonError(f"Polygon JSON decode failed: {e}") from e
 
-        if r.status_code >= 400:
-            msg = data.get("error") or data.get("message") or str(data)
-            raise PolygonError(f"Polygon HTTP {r.status_code}: {msg}")
+    @staticmethod
+    def _is_not_authorized(err: Exception) -> bool:
+        s = str(err)
+        return ("HTTP 403" in s) or ("NOT_AUTHORIZED" in s) or ("not entitled" in s.lower())
 
-        return data
-
-    def get_spot_last(self, ticker: str) -> float:
+    def get_last_trade(self, symbol: str) -> UnderlyingSnapshot:
         """
-        Equity last trade price.
-
-        Endpoint: /v2/last/trade/{ticker}
+        STRICT real-time last trade endpoint. May 403 on free/basic plans.
         """
-        ticker = ticker.upper().strip()
-        data = self._get(f"/v2/last/trade/{ticker}")
-        # Expected: {"status":"OK","results":{"p":..., ...}}
+        symbol = symbol.upper().strip()
+        data = self._get_json(f"/v2/last/trade/{symbol}")
+
         results = data.get("results") or {}
-        p = results.get("p")
-        if p is None:
-            raise PolygonError(f"Unexpected response for last trade: {data}")
-        return float(p)
+        price = results.get("p")
+        ts_ms = results.get("t")
 
-    def list_option_contracts(
-        self,
-        underlying: str,
-        as_of: Optional[str] = None,
-        expiration_date: Optional[str] = None,
-        contract_type: Optional[str] = None,  # "call" / "put"
-        strike_price: Optional[float] = None,
-        limit: int = 1000,
-    ) -> List[Dict[str, Any]]:
+        if price is None:
+            raise PolygonError(f"Polygon last-trade response missing price. Payload={data}")
+
+        if ts_ms is None:
+            ts = datetime.now(timezone.utc)
+        else:
+            ts = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc)
+
+        return UnderlyingSnapshot(symbol=symbol, spot=float(price), ts=ts)
+
+    def get_prev_close(self, symbol: str) -> UnderlyingSnapshot:
         """
-        List option contracts for an underlying.
-
-        Endpoint: /v3/reference/options/contracts
-        Common params:
-          - underlying_ticker=SPY
-          - as_of=YYYY-MM-DD
-          - expiration_date=YYYY-MM-DD
-          - contract_type=call|put
-          - strike_price=...
-          - limit=...
+        Previous close (EOD proxy spot). Often available on free/basic.
         """
-        underlying = underlying.upper().strip()
+        symbol = symbol.upper().strip()
+        data = self._get_json(f"/v2/aggs/ticker/{symbol}/prev")
 
-        params: Dict[str, Any] = {
-            "underlying_ticker": underlying,
-            "limit": int(limit),
-        }
-        if as_of:
-            params["as_of"] = as_of
-        if expiration_date:
-            params["expiration_date"] = expiration_date
-        if contract_type:
-            params["contract_type"] = contract_type.lower()
-        if strike_price is not None:
-            params["strike_price"] = float(strike_price)
+        # Expected shape:
+        # {"status":"OK","resultsCount":1,"results":[{"T":"SPY","c":500.12,"t":...}]}
+        results = data.get("results") or []
+        if not results:
+            raise PolygonError(f"Polygon prev-close response missing results. Payload={data}")
 
-        out: List[Dict[str, Any]] = []
-        next_url: Optional[str] = None
+        row = results[0] or {}
+        close_px = row.get("c")
+        ts_ms = row.get("t")
 
-        # Polygon is paginated. We follow next_url if present.
-        while True:
-            if next_url:
-                # next_url is a full URL and already contains apiKey sometimes; but not guaranteed.
-                # We re-call via requests to preserve it exactly, then inject apiKey if missing.
-                url = next_url
-                if "apiKey=" not in url:
-                    sep = "&" if "?" in url else "?"
-                    url = f"{url}{sep}apiKey={self.cfg.api_key}"
-                try:
-                    r = requests.get(url, timeout=self.cfg.timeout_sec)
-                    data = r.json()
-                except Exception as e:
-                    raise PolygonError(f"Pagination error calling Polygon: {e}") from e
+        if close_px is None:
+            raise PolygonError(f"Polygon prev-close response missing close price. Payload={data}")
 
-                if r.status_code >= 400:
-                    msg = data.get("error") or data.get("message") or str(data)
-                    raise PolygonError(f"Polygon HTTP {r.status_code}: {msg}")
-            else:
-                data = self._get("/v3/reference/options/contracts", params=params)
+        if ts_ms is None:
+            ts = datetime.now(timezone.utc)
+        else:
+            ts = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc)
 
-            results = data.get("results") or []
-            if not isinstance(results, list):
-                raise PolygonError(f"Unexpected contracts response: {data}")
+        return UnderlyingSnapshot(symbol=symbol, spot=float(close_px), ts=ts)
 
-            out.extend(results)
+    def get_spot_best_effort(self, symbol: str) -> Tuple[UnderlyingSnapshot, str]:
+        """
+        Best-effort spot:
+        1) Try last trade
+        2) If blocked, fall back to prev close
+        Returns (snapshot, source_tag)
+        """
+        try:
+            snap = self.get_last_trade(symbol)
+            return snap, "last_trade"
+        except Exception as e:
+            if self._is_not_authorized(e):
+                snap = self.get_prev_close(symbol)
+                return snap, "prev_close"
+            raise
 
-            next_url = data.get("next_url")
-            if not next_url:
-                break
-
-            # Safety: don’t loop forever if Polygon keeps returning next_url
-            if len(out) > 200_000:
-                raise PolygonError("Too many option contracts returned; aborting pagination.")
-
-        return out
+    # Backward-compatible name used by your API code:
+    def get_spot(self, symbol: str) -> UnderlyingSnapshot:
+        """
+        Default get_spot now uses best-effort (so your /market/spot won't die on 403).
+        """
+        snap, _src = self.get_spot_best_effort(symbol)
+        return snap
